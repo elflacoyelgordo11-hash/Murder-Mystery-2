@@ -16,15 +16,31 @@ local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
 
 local coinTweenEnabled = false
 local coinWalkEnabled = false
-local COIN_TWEEN_SPEED = 25   -- studs/sec for tween, and WalkSpeed for the walk mode
+local COIN_TWEEN_SPEED = 25   -- studs/sec for tween.
 local COIN_DELAY = 1.5        -- seconds to wait after firing each coin before moving to the next
+local COIN_MAX_DISTANCE = 5000 -- studs -- coins farther than this are ignored until closer
 local silentAimEnabled = false
 local SILENT_AIM_MAX_DISTANCE = 5000 -- knife throws skip anyone this far or farther
-local COIN_MAX_DISTANCE = 5000 -- studs -- coins farther than this are ignored until closer
 local SILENT_AIM_FOV = 90 -- total cone angle in degrees, centered on your camera's crosshair
+local autoPlayEnabled = false
+local autoPlayToken = 0
+local autoCoinDone = {}
+local lastShot, lastThrow = 0, 0
+local AUTO_MAX_DISTANCE = 5000   -- knife targets / GunDrop range
+local AUTO_SHOOT_RANGE = 250     -- sheriff only fires inside this range
+local AUTO_SHOOT_STANDOFF = 40   -- sheriff stops chasing once this close with a clear line
+local AUTO_SHOOT_COOLDOWN = 0.6
+local AUTO_THROW_COOLDOWN = 1.0
+local AUTO_STAB_RANGE = 6        -- melee swing when this close to the closest target
+local FLEE_RANGE = 70            -- how far away a knife holder can be and still count as a threat
+local FLEE_CLOSE_RANGE = 22      -- inside this, any equipped knife holder counts even if not running at you
+local nextJukeAt, jukeUntil, jukeDir = 0, 0, nil
+local AntiAFK = false
+local AntiAFKConnection = nil
 -- Finds the closest part currently named "Coin_Server" that we haven't already fired
 -- and that's within COIN_MAX_DISTANCE -- farther ones are skipped (not marked done,
 -- so they'll naturally get picked up once they're close enough)
@@ -40,12 +56,10 @@ local function findClosestCoinServer(fromPos, done)
     end
     return best
 end
-
 -- Watches root's position while waiting on a MoveTo and jumps if it stops making
 -- progress for a short stretch -- catches obstacles in the way that the pathfinder's
 -- own jump-waypoints don't account for (small ledges, debris, other players, etc.)
 local STUCK_CHECK_INTERVAL = 0.3
-
 -- Forces a single, clean jump: sets the Jump property AND explicitly changes the
 -- humanoid's state, since on some custom character controllers a single Jump=true
 -- can get missed. No repeated/held spam here -- that's what was causing the
@@ -57,7 +71,6 @@ local function forceJump(humanoid)
         humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
     end)
 end
-
 -- Waits for a single MoveTo to finish, jumping if stuck. Returns (reached, badlyStuck) --
 -- badlyStuck means it went multiple consecutive checks with almost no progress even
 -- after jumping, which signals the waypoint itself may be unreachable (e.g. the path
@@ -84,7 +97,6 @@ local function waitForMoveTo(humanoid, root, isStillEnabled, timeout)
 
         if sinceLastCheck >= STUCK_CHECK_INTERVAL then
             sinceLastCheck = 0
-
             -- scale the "barely moved" threshold to the character's actual speed
             -- instead of a fixed stud count, so slower game-default WalkSpeeds
             -- don't get falsely flagged as stuck (which was also causing stutter)
@@ -116,7 +128,6 @@ local function waitForMoveTo(humanoid, root, isStillEnabled, timeout)
     conn:Disconnect()
     return reached, false
 end
-
 -- Walks a humanoid to destinationPos using PathfindingService, following waypoints
 -- and jumping where needed. If progress stalls against something in the way (a wall
 -- corner the path clipped, a moved obstacle, etc.) it recomputes a brand new path from
@@ -307,7 +318,6 @@ local UNSTUCK_DIRECTIONS = {
     Vector3.new(1, 0, -1).Unit, Vector3.new(-1, 0, 1).Unit,
 }
 local UNSTUCK_FREE_DISTANCE = 3 -- studs of actual movement that counts as "freed"
-
 -- Checks a short distance ahead in a direction for anything solid, so the escape
 -- maneuver only ever tries directions that are actually open instead of ramming
 -- into whatever's already causing the problem.
@@ -330,7 +340,6 @@ end
 
 local function attemptUnstuck(humanoid, root, isStillEnabled)
     local character = humanoid.Parent
-
     -- only consider directions that are raycast-clear right now, so it never
     -- deliberately walks straight at the thing it's stuck on
     local openDirections = {}
@@ -484,7 +493,6 @@ local function addESP(player)
     highlight.Parent = character
 
     espHighlights[player] = highlight
-
     -- keep the color updated if they pick up/drop Knife or Gun later
     local conn1 = character.DescendantAdded:Connect(function()
         if espHighlights[player] then
@@ -746,7 +754,6 @@ local function addGunDropESP(part)
     highlight.Parent = part
 
     gunDropHighlights[part] = highlight
-
     -- clean up automatically if the part itself gets destroyed/removed
     part.AncestryChanged:Connect(function(_, parent)
         if not parent and gunDropHighlights[part] then
@@ -790,7 +797,6 @@ MainTab:CreateToggle({
         end
 
         scanForGunDrops()
-
         -- watch for new GunDrop parts spawning in later
         gunDropWatcherConn = workspace.DescendantAdded:Connect(function(obj)
             if gunDropEspEnabled and obj.Name == "GunDrop" and obj:IsA("BasePart") then
@@ -799,7 +805,7 @@ MainTab:CreateToggle({
         end)
     end,
 })
-
+-- ================= Get Gun button =================
 MainTab:CreateButton({
     Name = "Get Gun (If Dropped)",
     Callback = function()
@@ -814,7 +820,6 @@ MainTab:CreateButton({
             return
         end
 
-        -- find the GunDrop part (same check your Gun ESP uses)
         local drop
         for _, obj in ipairs(workspace:GetDescendants()) do
             if obj.Name == "GunDrop" and obj:IsA("BasePart") then
@@ -847,7 +852,7 @@ MainTab:CreateButton({
         end
     end,
 })
-
+-- ================= Shared combat helpers =================
 -- true if the player has the tool equipped or in their Backpack
 local function hasTool(player, toolName)
     local char = player.Character
@@ -857,7 +862,6 @@ local function hasTool(player, toolName)
     local backpack = player:FindFirstChild("Backpack")
     return backpack ~= nil and backpack:FindFirstChild(toolName) ~= nil
 end
-
 -- position to aim at (their root part), only if they're alive
 local function getAimPos(player)
     local char = player.Character
@@ -875,69 +879,9 @@ local function makeArgs(originPos, targetPos)
     end
     return CFrame.lookAt(lookFrom, targetPos), CFrame.new(targetPos)
 end
-
--- Returns true if it replaced the game's call with its own
-local function handleSilentAim(remote, ...)
-    local args = {...}
-    local lp = Players.LocalPlayer
-    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return false end
-
-    local origin = (typeof(args[1]) == "CFrame") and args[1].Position or myRoot.Position
-
-    if remote.Name == "Shoot" and hasTool(lp, "Gun") then
-        -- Sheriff: redirect the shot at whoever has the Knife
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp and hasTool(plr, "Knife") then
-                local pos = getAimPos(plr)
-                if pos then
-                    local a1, a2 = makeArgs(origin, pos)
-                    remote.FireServer(remote, a1, a2)
-                    return true
-                end
-            end
-        end
-
-    elseif remote.Name == "KnifeThrown" and hasTool(lp, "Knife") then
-        -- Murderer: throw at everyone within range
-        local fired = false
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp then
-                local pos = getAimPos(plr)
-                if pos and (pos - myRoot.Position).Magnitude < SILENT_AIM_MAX_DISTANCE then
-                    local a1, a2 = makeArgs(origin, pos)
-                    remote.FireServer(remote, a1, a2)
-                    fired = true
-                end
-            end
-        end
-        return fired
-    end
-
-    return false
-end
-
-if hookmetamethod and newcclosure and getnamecallmethod and checkcaller then
-    local oldNamecall
-    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        if silentAimEnabled
-            and getnamecallmethod() == "FireServer"
-            and typeof(self) == "Instance"
-            and not checkcaller()
-            and (self.Name == "Shoot" or self.Name == "KnifeThrown")
-        then
-            local ok, handled = pcall(handleSilentAim, self, ...)
-            if ok and handled then
-                return
-            end
-        end
-        return oldNamecall(self, ...)
-    end))
-end
-
 -- Wall check: true if nothing solid is between origin and the target.
 -- Ignores all player characters and non-collidable parts (decor, invisible triggers).
-local function hasLineOfSight(originPos, targetPos)
+local function hasClearShot(originPos, targetPos)
     local ignore = {}
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr.Character then
@@ -953,67 +897,17 @@ local function hasLineOfSight(originPos, targetPos)
         params.FilterDescendantsInstances = ignore
         local result = workspace:Raycast(originPos, targetPos - originPos, params)
         if not result then
-            return true -- nothing in the way
+            return true
         end
         if result.Instance.CanCollide then
-            return false -- solid wall/obstacle
+            return false
         end
-        table.insert(ignore, result.Instance) -- skip non-collidable part and keep checking
+        table.insert(ignore, result.Instance)
     end
 
     return true
 end
-
--- Returns true if it replaced the game's call with its own
-local function handleSilentAim(remote, ...)
-    local args = {...}
-    local lp = Players.LocalPlayer
-    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return false end
-
-    local origin = (typeof(args[1]) == "CFrame") and args[1].Position or myRoot.Position
-
-    if remote.Name == "Shoot" and hasTool(lp, "Gun") then
-        -- Sheriff: redirect the shot at whoever has the Knife (only if there's a clear line)
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp and hasTool(plr, "Knife") then
-                local pos = getAimPos(plr)
-                if pos and hasLineOfSight(origin, pos) then
-                    local a1, a2 = makeArgs(origin, pos)
-                    remote.FireServer(remote, a1, a2)
-                    return true
-                end
-            end
-        end
-
-    elseif remote.Name == "KnifeThrown" and hasTool(lp, "Knife") then
-        -- Murderer: throw at the closest player in range that isn't behind a wall
-        local bestPos, bestDist
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp then
-                local pos = getAimPos(plr)
-                if pos then
-                    local dist = (pos - myRoot.Position).Magnitude
-                    if dist < SILENT_AIM_MAX_DISTANCE
-                        and (not bestDist or dist < bestDist)
-                        and hasLineOfSight(origin, pos)
-                    then
-                        bestPos, bestDist = pos, dist
-                    end
-                end
-            end
-        end
-
-        if bestPos then
-            local a1, a2 = makeArgs(origin, bestPos)
-            remote.FireServer(remote, a1, a2)
-            return true
-        end
-    end
-
-    return false
-end
-
+-- ================= Silent Aim =================
 -- Is the position inside the cone in front of your camera? Returns (inFront, angleFromCrosshair)
 local function getFrontAngle(pos)
     local cam = workspace.CurrentCamera
@@ -1026,73 +920,6 @@ local function getFrontAngle(pos)
     local angle = math.deg(math.acos(dot))
     return angle <= SILENT_AIM_FOV / 2, angle
 end
-
--- A player is a valid target only if they're alive, in front of you, and not behind a wall
-local function isValidTarget(player, origin)
-    local pos = getAimPos(player)
-    if not pos then return nil end
-
-    local inFront, angle = getFrontAngle(pos)
-    if not inFront then return nil end
-
-    if not hasLineOfSight(origin, pos) then return nil end
-
-    return pos, angle
-end
-
--- Returns true if it replaced the game's call with its own
-local function handleSilentAim(remote, ...)
-    local args = {...}
-    local lp = Players.LocalPlayer
-    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return false end
-
-    local origin = (typeof(args[1]) == "CFrame") and args[1].Position or myRoot.Position
-
-    if remote.Name == "Shoot" and hasTool(lp, "Gun") then
-        -- Sheriff: murderer must be in front of you and not behind a wall.
-        -- If more than one Knife holder qualifies, take the one closest to your crosshair.
-        local bestPos, bestAngle
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp and hasTool(plr, "Knife") then
-                local pos, angle = isValidTarget(plr, origin)
-                if pos and (not bestAngle or angle < bestAngle) then
-                    bestPos, bestAngle = pos, angle
-                end
-            end
-        end
-
-        if bestPos then
-            local a1, a2 = makeArgs(origin, bestPos)
-            remote.FireServer(remote, a1, a2)
-            return true
-        end
-
-    elseif remote.Name == "KnifeThrown" and hasTool(lp, "Knife") then
-        -- Murderer: closest player in front of you, in range, not behind a wall
-        local bestPos, bestDist
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp then
-                local pos = isValidTarget(plr, origin)
-                if pos then
-                    local dist = (pos - myRoot.Position).Magnitude
-                    if dist < SILENT_AIM_MAX_DISTANCE and (not bestDist or dist < bestDist) then
-                        bestPos, bestDist = pos, dist
-                    end
-                end
-            end
-        end
-
-        if bestPos then
-            local a1, a2 = makeArgs(origin, bestPos)
-            remote.FireServer(remote, a1, a2)
-            return true
-        end
-    end
-
-    return false
-end
-
 -- Where your mouse/crosshair is pointing in the world
 local function getMouseAimPos()
     local cam = workspace.CurrentCamera
@@ -1116,18 +943,17 @@ local function getMouseAimPos()
         params.FilterDescendantsInstances = ignore
         local result = workspace:Raycast(ray.Origin, direction, params)
         if not result then
-            return ray.Origin + direction -- aiming at the sky/void
+            return ray.Origin + direction
         end
         if result.Instance.CanCollide then
             return result.Position
         end
-        table.insert(ignore, result.Instance) -- skip non-collidable parts
+        table.insert(ignore, result.Instance)
     end
 
     return ray.Origin + direction
 end
-
--- Alive and inside the front-sight cone. Walls are NOT checked here, that's done after picking.
+-- Alive and inside the front-sight cone. Walls are checked after picking.
 local function getFrontTarget(player)
     local pos = getAimPos(player)
     if not pos then return nil end
@@ -1137,15 +963,13 @@ local function getFrontTarget(player)
 
     return pos, angle
 end
-
 -- Final aim position: the player if there's a clear line, otherwise wherever your mouse points
 local function resolveAim(origin, targetPos)
-    if hasLineOfSight(origin, targetPos) then
+    if hasClearShot(origin, targetPos) then
         return targetPos
     end
     return getMouseAimPos() or targetPos
 end
-
 -- Returns true if it replaced the game's call with its own
 local function handleSilentAim(remote, ...)
     local args = {...}
@@ -1199,6 +1023,24 @@ local function handleSilentAim(remote, ...)
 
     return false
 end
+-- Hook is installed AFTER handleSilentAim so it uses the final version
+if hookmetamethod and newcclosure and getnamecallmethod and checkcaller then
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        if silentAimEnabled
+            and getnamecallmethod() == "FireServer"
+            and typeof(self) == "Instance"
+            and not checkcaller()
+            and (self.Name == "Shoot" or self.Name == "KnifeThrown")
+        then
+            local ok, handled = pcall(handleSilentAim, self, ...)
+            if ok and handled then
+                return
+            end
+        end
+        return oldNamecall(self, ...)
+    end))
+end
 
 MainTab:CreateToggle({
     Name = "Silent Aim",
@@ -1227,12 +1069,445 @@ MainTab:CreateSlider({
         SILENT_AIM_FOV = Value
     end,
 })
+-- ================= Auto Play =================
+-- (everything a function calls is defined ABOVE it, so nothing is nil when it runs)
+local autoGunDrop = nil
+workspace.DescendantAdded:Connect(function(obj)
+    if obj.Name == "GunDrop" and obj:IsA("BasePart") then
+        autoGunDrop = obj
+    end
+end)
 
+local function getGunDrop()
+    if autoGunDrop and autoGunDrop:IsDescendantOf(workspace) then
+        return autoGunDrop
+    end
+    autoGunDrop = nil
+    return nil
+end
+
+local function scanGunDrop()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "GunDrop" and obj:IsA("BasePart") then
+            autoGunDrop = obj
+            return
+        end
+    end
+end
+-- Finds a RemoteEvent by name: on the player, then anywhere in the game, then nil instances
+local remoteCache = {}
+local function findRemote(name)
+    if remoteCache[name] then return remoteCache[name] end
+
+    local found = Players.LocalPlayer:FindFirstChild(name)
+    if not (found and found:IsA("RemoteEvent")) then
+        found = nil
+        for _, v in ipairs(game:GetDescendants()) do
+            if v.Name == name and v:IsA("RemoteEvent") then
+                found = v
+                break
+            end
+        end
+    end
+    if not found and getnilinstances then
+        for _, v in ipairs(getnilinstances()) do
+            if v.Name == name and v:IsA("RemoteEvent") then
+                found = v
+                break
+            end
+        end
+    end
+
+    if found then remoteCache[name] = found end
+    return found
+end
+
+local function fireAimed(remoteName, origin, pos)
+    local remote = findRemote(remoteName)
+    if remote then
+        local a1, a2 = makeArgs(origin, pos)
+        remote:FireServer(a1, a2)
+    end
+end
+
+local function equipTool(humanoid, character, name)
+    local tool = character:FindFirstChild(name)
+    if tool then return tool end
+
+    local backpack = Players.LocalPlayer:FindFirstChild("Backpack")
+    tool = backpack and backpack:FindFirstChild(name)
+    if tool and tool:IsA("Tool") then
+        humanoid:EquipTool(tool)
+        return tool
+    end
+end
+
+local function getRole()
+    local lp = Players.LocalPlayer
+    if hasTool(lp, "Knife") then return "knife" end
+    if hasTool(lp, "Gun") then return "gun" end
+    return "none"
+end
+-- closest alive player holding a Knife (only visible to you when it's equipped)
+local function findMurderer(fromPos)
+    local lp = Players.LocalPlayer
+    local best, bestPos, bestDist
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= lp and hasTool(plr, "Knife") then
+            local pos = getAimPos(plr)
+            if pos then
+                local dist = (pos - fromPos).Magnitude
+                if not bestDist or dist < bestDist then
+                    best, bestPos, bestDist = plr, pos, dist
+                end
+            end
+        end
+    end
+    return best, bestPos, bestDist
+end
+-- Chasing: straight at them with a clear line, otherwise follow the next path waypoint
+local lastChasePos, chaseStuckTicks = nil, 0
+local function chaseStep(humanoid, root, targetPos)
+    if lastChasePos and (root.Position - lastChasePos).Magnitude < 0.5 then
+        chaseStuckTicks += 1
+        if chaseStuckTicks >= 2 then
+            forceJump(humanoid)
+            chaseStuckTicks = 0
+        end
+    else
+        chaseStuckTicks = 0
+    end
+    lastChasePos = root.Position
+
+    if hasClearShot(root.Position, targetPos) then
+        humanoid:MoveTo(targetPos)
+        return
+    end
+
+    local waypoints = computePathWaypoints(root.Position, targetPos)
+    local nextWp = waypoints and (waypoints[2] or waypoints[1])
+    if nextWp then
+        if nextWp.Action == Enum.PathWaypointAction.Jump then
+            forceJump(humanoid)
+        end
+        humanoid:MoveTo(nextWp.Position)
+    else
+        humanoid:MoveTo(targetPos)
+    end
+end
+
+local function stopMoving(humanoid, root)
+    humanoid:MoveTo(root.Position)
+end
+-- An alive player with the Knife EQUIPPED who is close, or running toward you
+local function findThreat(root, range)
+    local lp = Players.LocalPlayer
+    range = range or FLEE_RANGE
+    local best, bestPos, bestDist
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= lp then
+            local char = plr.Character
+            if char and char:FindFirstChild("Knife") then
+                local theirRoot = char:FindFirstChild("HumanoidRootPart")
+                local hum = char:FindFirstChildOfClass("Humanoid")
+                if theirRoot and hum and hum.Health > 0 then
+                    local toMe = root.Position - theirRoot.Position
+                    local dist = toMe.Magnitude
+                    if dist <= range then
+                        local vel = theirRoot.AssemblyLinearVelocity
+                        local flatVel = Vector3.new(vel.X, 0, vel.Z)
+                        local chasing = dist <= FLEE_CLOSE_RANGE
+
+                        if not chasing and flatVel.Magnitude > 6 then
+                            local flatToMe = Vector3.new(toMe.X, 0, toMe.Z)
+                            if flatToMe.Magnitude > 0.01 then
+                                chasing = flatVel.Unit:Dot(flatToMe.Unit) > 0.5 -- moving toward us
+                            end
+                        end
+
+                        if chasing and (not bestDist or dist < bestDist) then
+                            best, bestPos, bestDist = plr, theirRoot.Position, dist
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return best, bestPos, bestDist
+end
+-- Nothing solid in the way for `length` studs in direction `dir`
+local function isRunClear(root, dir, length)
+    local ignore = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then
+            table.insert(ignore, plr.Character)
+        end
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignore
+    params.IgnoreWater = true
+
+    local result = workspace:Raycast(root.Position, dir.Unit * length, params)
+    return (not result) or (not result.Instance.CanCollide)
+end
+-- Ground exists under a point, so it doesn't run off the map edge
+local function hasGround(pos)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {Players.LocalPlayer.Character}
+    params.IgnoreWater = true
+    return workspace:Raycast(pos + Vector3.new(0, 5, 0), Vector3.new(0, -30, 0), params) ~= nil
+end
+
+local function autoFleeStep(humanoid, root, threatPos)
+    local now = tick()
+    local dist = (root.Position - threatPos).Magnitude
+
+    local away = Vector3.new(root.Position.X - threatPos.X, 0, root.Position.Z - threatPos.Z)
+    if away.Magnitude < 0.01 then
+        away = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5)
+    end
+    away = away.Unit
+    -- juke in progress: keep sidestepping until it ends or hits a wall
+    if now < jukeUntil and jukeDir then
+        if isRunClear(root, jukeDir, 12) then
+            humanoid:MoveTo(root.Position + jukeDir * 16)
+            return
+        end
+        jukeUntil = 0
+    -- start a new juke every so often once the chaser gets close
+    elseif now >= nextJukeAt and dist <= 30 then
+        nextJukeAt = now + 1.2 + math.random() * 2
+        local side = (math.random() < 0.5) and 1 or -1
+        local perp = Vector3.new(-away.Z, 0, away.X) * side
+        local dir = (perp + away * 0.3).Unit -- mostly sideways, cuts across their line
+
+        if isRunClear(root, dir, 12) and hasGround(root.Position + dir * 12) then
+            jukeDir = dir
+            jukeUntil = now + 0.45
+            if math.random() < 0.5 then
+                forceJump(humanoid)
+            end
+            humanoid:MoveTo(root.Position + dir * 16)
+            return
+        end
+    end
+    -- run away: straight back first, then fan out left/right until something is open
+    for _, deg in ipairs({0, 25, -25, 50, -50, 80, -80, 120, -120}) do
+        local rad = math.rad(deg)
+        local c, s = math.cos(rad), math.sin(rad)
+        local dir = Vector3.new(away.X * c - away.Z * s, 0, away.X * s + away.Z * c)
+
+        if isRunClear(root, dir, 18) and hasGround(root.Position + dir * 18) then
+            humanoid:MoveTo(root.Position + dir * 25)
+            return
+        end
+    end
+    -- boxed in on every side: jump and try to wriggle free
+    forceJump(humanoid)
+    attemptUnstuck(humanoid, root, function() return autoPlayEnabled end)
+end
+-- No gear: GunDrop first, then sometimes the nearest coin, otherwise wander
+local function autoIdleStep(humanoid, root, startRole)
+    local function stillOk()
+        if not autoPlayEnabled or getRole() ~= startRole then return false end
+        if startRole == "gun" and findMurderer(root.Position) then return false end
+        if startRole == "none" then
+            if findThreat(root) then return false end -- chaser appeared, stop and run
+            local drop = getGunDrop()
+            if drop and (drop.Position - root.Position).Magnitude <= AUTO_MAX_DISTANCE then
+                return false
+            end
+        end
+        return true
+    end
+
+    if startRole == "none" then
+        local drop = getGunDrop()
+        if drop and (drop.Position - root.Position).Magnitude <= AUTO_MAX_DISTANCE then
+            local function dropOk()
+                return autoPlayEnabled
+                    and getRole() == "none"
+                    and drop:IsDescendantOf(workspace)
+                    and not findThreat(root, 15) -- only bail out if the chaser is right on top of us
+            end
+
+            walkToPosition(humanoid, root, drop.Position, dropOk)
+
+            if dropOk() then
+                pcall(function()
+                    firetouchinterest(root, drop, 0)
+                    firetouchinterest(root, drop, 1)
+                end)
+                task.wait(0.3)
+            end
+            return
+        end
+    end
+    -- sometimes go for the nearest coin
+    if math.random() < 0.6 then
+        local coin = findEasiestCoinServer(root.Position, autoCoinDone)
+        if coin then
+            local reached = walkToPosition(humanoid, root, coin.Position, stillOk)
+            if reached and stillOk() then
+                pcall(function()
+                    firetouchinterest(root, coin, 0)
+                    firetouchinterest(root, coin, 1)
+                end)
+                autoCoinDone[coin] = true
+            elseif stillOk() then
+                autoCoinDone[coin] = true -- unreachable, don't retry it
+            end
+            task.wait(0.2)
+            return
+        end
+    end
+    -- otherwise wander to a random nearby spot
+    local angle = math.random() * math.pi * 2
+    local dist = math.random(25, 70)
+    local dest = root.Position + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+    walkToPosition(humanoid, root, dest, stillOk)
+end
+-- Sheriff: find the Knife holder, chase until there's a clear line, then shoot
+local function autoGunStep(humanoid, root, char)
+    equipTool(humanoid, char, "Gun")
+
+    local _, pos, dist = findMurderer(root.Position)
+    if not pos then
+        autoIdleStep(humanoid, root, "gun") -- murderer not visible to us, keep busy
+        return
+    end
+
+    local origin = (char:FindFirstChild("Head") or root).Position
+    local los = hasClearShot(origin, pos)
+
+    if los and dist <= AUTO_SHOOT_RANGE and tick() - lastShot >= AUTO_SHOOT_COOLDOWN then
+        lastShot = tick()
+        fireAimed("Shoot", origin, pos)
+    end
+
+    if los and dist <= AUTO_SHOOT_STANDOFF then
+        stopMoving(humanoid, root)
+    else
+        chaseStep(humanoid, root, pos)
+    end
+    task.wait(0.15)
+end
+-- Murderer: throw at everyone in range with a clear line, chase the closest, stab when close
+local function autoKnifeStep(humanoid, root, char)
+    local tool = equipTool(humanoid, char, "Knife")
+    local lp = Players.LocalPlayer
+    local origin = (char:FindFirstChild("Head") or root).Position
+
+    local targets = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= lp then
+            local pos = getAimPos(plr)
+            if pos then
+                local dist = (pos - root.Position).Magnitude
+                if dist <= AUTO_MAX_DISTANCE then
+                    table.insert(targets, {pos = pos, dist = dist})
+                end
+            end
+        end
+    end
+
+    if #targets == 0 then
+        autoIdleStep(humanoid, root, "knife")
+        return
+    end
+
+    table.sort(targets, function(a, b) return a.dist < b.dist end)
+
+    if tick() - lastThrow >= AUTO_THROW_COOLDOWN then
+        local threw = false
+        for _, t in ipairs(targets) do
+            if hasClearShot(origin, t.pos) then
+                fireAimed("KnifeThrown", origin, t.pos)
+                threw = true
+            end
+        end
+        if threw then lastThrow = tick() end
+    end
+
+    local closest = targets[1]
+    chaseStep(humanoid, root, closest.pos)
+
+    if closest.dist <= AUTO_STAB_RANGE and tool and tool:IsA("Tool") and tool.Parent == char then
+        pcall(function() tool:Activate() end)
+    end
+
+    task.wait(0.15)
+end
+
+local function startAutoPlay()
+    autoPlayToken += 1
+    local myToken = autoPlayToken
+
+    task.spawn(function()
+        while autoPlayEnabled and autoPlayToken == myToken do
+            local char = Players.LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+
+            if not root or not humanoid or humanoid.Health <= 0 then
+                task.wait(0.5)
+            else
+                local ok, err = pcall(function()
+                    local role = getRole()
+                    if role == "knife" then
+                        autoKnifeStep(humanoid, root, char)
+                    elseif role == "gun" then
+                        autoGunStep(humanoid, root, char)
+                    else
+                        local _, threatPos = findThreat(root)
+                        if threatPos then
+                            autoFleeStep(humanoid, root, threatPos)
+                            task.wait(0.1)
+                        else
+                            autoIdleStep(humanoid, root, "none")
+                        end
+                    end
+                end)
+                if not ok then
+                    warn("[Auto Play] " .. tostring(err))
+                    task.wait(0.5)
+                end
+                task.wait(0.1)
+            end
+        end
+    end)
+end
+
+MainTab:CreateToggle({
+    Name = "Auto Play",
+    CurrentValue = false,
+    Callback = function(value)
+        autoPlayEnabled = value
+        if value then
+            autoCoinDone = {}
+            scanGunDrop()
+            startAutoPlay()
+        else
+            local char = Players.LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+            if root and humanoid then
+                humanoid:MoveTo(root.Position)
+            end
+        end
+    end,
+})
+-- ================= Settings tab =================
 SettingsTab:CreateButton({
-   Name = "Rejoin",
-   Callback = function()
+    Name = "Rejoin",
+    Callback = function()
         game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId)
-   end,
+    end,
 })
 
 SettingsTab:CreateToggle({
@@ -1240,11 +1515,7 @@ SettingsTab:CreateToggle({
     CurrentValue = false,
     Flag = "Disable3DRendering",
     Callback = function(Value)
-        if Value then
-            RunService:Set3dRenderingEnabled(false)
-        else
-            RunService:Set3dRenderingEnabled(true)
-        end
+        RunService:Set3dRenderingEnabled(not Value)
     end,
 })
 
@@ -1252,5 +1523,26 @@ SettingsTab:CreateButton({
     Name = "Destroy UI",
     Callback = function()
         Rayfield:Destroy()
-    end
+    end,
+})
+
+SettingsTab:CreateToggle({
+    Name = "Anti AFK",
+    CurrentValue = false,
+    Flag = "AntiAFK",
+    Callback = function(Value)
+        AntiAFK = Value
+
+        if AntiAFK then
+            AntiAFKConnection = Players.LocalPlayer.Idled:Connect(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        else
+            if AntiAFKConnection then
+                AntiAFKConnection:Disconnect()
+                AntiAFKConnection = nil
+            end
+        end
+    end,
 })
