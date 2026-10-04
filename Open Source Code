@@ -1,0 +1,1256 @@
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+--Window
+local Window = Rayfield:CreateWindow({
+    Name = "Murder Mystery 2",
+    LoadingTitle = "MOUSED hub is loading",
+    LoadingSubtitle = "By Nonfakerr",
+    ConfigurationSaving = {
+        Enabled = false,
+        FolderName = "MOUSEDConfig",
+        FileName = "MOUSEDSetting"
+    }
+})
+
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local coinTweenEnabled = false
+local coinWalkEnabled = false
+local COIN_TWEEN_SPEED = 25   -- studs/sec for tween, and WalkSpeed for the walk mode
+local COIN_DELAY = 1.5        -- seconds to wait after firing each coin before moving to the next
+local silentAimEnabled = false
+local SILENT_AIM_MAX_DISTANCE = 5000 -- knife throws skip anyone this far or farther
+local COIN_MAX_DISTANCE = 5000 -- studs -- coins farther than this are ignored until closer
+local SILENT_AIM_FOV = 90 -- total cone angle in degrees, centered on your camera's crosshair
+-- Finds the closest part currently named "Coin_Server" that we haven't already fired
+-- and that's within COIN_MAX_DISTANCE -- farther ones are skipped (not marked done,
+-- so they'll naturally get picked up once they're close enough)
+local function findClosestCoinServer(fromPos, done)
+    local best, bestDist
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "Coin_Server" and obj:IsA("BasePart") and not done[obj] then
+            local dist = (obj.Position - fromPos).Magnitude
+            if dist <= COIN_MAX_DISTANCE and (not bestDist or dist < bestDist) then
+                best, bestDist = obj, dist
+            end
+        end
+    end
+    return best
+end
+
+-- Watches root's position while waiting on a MoveTo and jumps if it stops making
+-- progress for a short stretch -- catches obstacles in the way that the pathfinder's
+-- own jump-waypoints don't account for (small ledges, debris, other players, etc.)
+local STUCK_CHECK_INTERVAL = 0.3
+
+-- Forces a single, clean jump: sets the Jump property AND explicitly changes the
+-- humanoid's state, since on some custom character controllers a single Jump=true
+-- can get missed. No repeated/held spam here -- that's what was causing the
+-- stutter, bouncing the character every check while it was still mid-air from
+-- the previous jump.
+local function forceJump(humanoid)
+    pcall(function()
+        humanoid.Jump = true
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    end)
+end
+
+-- Waits for a single MoveTo to finish, jumping if stuck. Returns (reached, badlyStuck) --
+-- badlyStuck means it went multiple consecutive checks with almost no progress even
+-- after jumping, which signals the waypoint itself may be unreachable (e.g. the path
+-- is clipping a wall) and the caller should recompute a fresh path rather than push on.
+local STUCK_STREAK_FOR_RECOMPUTE = 3
+
+local function waitForMoveTo(humanoid, root, isStillEnabled, timeout)
+    local reached = false
+    local conn
+    conn = humanoid.MoveToFinished:Connect(function()
+        reached = true
+    end)
+
+    local waited = 0
+    local lastPos = root.Position
+    local sinceLastCheck = 0
+    local stuckStreak = 0
+    local jumpedThisStreak = false
+
+    while not reached and waited < timeout and isStillEnabled() do
+        task.wait(0.1)
+        waited += 0.1
+        sinceLastCheck += 0.1
+
+        if sinceLastCheck >= STUCK_CHECK_INTERVAL then
+            sinceLastCheck = 0
+
+            -- scale the "barely moved" threshold to the character's actual speed
+            -- instead of a fixed stud count, so slower game-default WalkSpeeds
+            -- don't get falsely flagged as stuck (which was also causing stutter)
+            local expectedMove = (humanoid.WalkSpeed or 16) * STUCK_CHECK_INTERVAL
+            local threshold = math.max(1, expectedMove * 0.35)
+
+            local currentPos = root.Position
+            if (currentPos - lastPos).Magnitude < threshold then
+                stuckStreak += 1
+                if not jumpedThisStreak then
+                    -- only jump once per stuck episode, not every check, so it
+                    -- doesn't keep re-triggering mid-air
+                    forceJump(humanoid)
+                    jumpedThisStreak = true
+                end
+            else
+                stuckStreak = 0
+                jumpedThisStreak = false
+            end
+            lastPos = currentPos
+
+            if stuckStreak >= STUCK_STREAK_FOR_RECOMPUTE then
+                conn:Disconnect()
+                return false, true
+            end
+        end
+    end
+
+    conn:Disconnect()
+    return reached, false
+end
+
+-- Walks a humanoid to destinationPos using PathfindingService, following waypoints
+-- and jumping where needed. If progress stalls against something in the way (a wall
+-- corner the path clipped, a moved obstacle, etc.) it recomputes a brand new path from
+-- the character's current position instead of blindly continuing the stale one.
+-- Returns true if it reached the end, false if it ran out of recompute attempts or
+-- the farm got disabled mid-walk.
+local MAX_RECOMPUTES = 5
+
+local function computePathWaypoints(fromPos, destinationPos)
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2.5,       -- a bit wider than the character for wall clearance
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = 4,     -- wider spacing -- fewer re-aims per path = smoother movement
+    })
+
+    local ok = pcall(function()
+        path:ComputeAsync(fromPos, destinationPos)
+    end)
+
+    if not ok or path.Status ~= Enum.PathStatus.Success then
+        return nil
+    end
+
+    return path:GetWaypoints()
+end
+-- Picks a coin from the closest few candidates, preferring whichever has the
+-- "easiest" path rather than just the raw-distance closest: fewer jump waypoints
+-- and a shorter actual walked route (not just straight-line distance) both count
+-- against a coin's score. Only checks the EASIEST_CANDIDATE_COUNT closest coins
+-- (not every coin in range) to keep this cheap -- it recomputes a path for each.
+local EASIEST_CANDIDATE_COUNT = 5
+
+local function findEasiestCoinServer(fromPos, done)
+    local candidates = {}
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "Coin_Server" and obj:IsA("BasePart") and not done[obj] then
+            local dist = (obj.Position - fromPos).Magnitude
+            if dist <= COIN_MAX_DISTANCE then
+                table.insert(candidates, {part = obj, dist = dist})
+            end
+        end
+    end
+
+    if #candidates == 0 then
+        return nil
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.dist < b.dist
+    end)
+
+    local bestPart, bestScore
+
+    for i = 1, math.min(EASIEST_CANDIDATE_COUNT, #candidates) do
+        local candidate = candidates[i]
+        local waypoints = computePathWaypoints(fromPos, candidate.part.Position)
+
+        local score
+        if not waypoints then
+            -- no valid path at all -- heavily penalize but don't fully exclude,
+            -- in case every candidate turns out unreachable right now
+            score = candidate.dist + 100000
+        else
+            local jumpCount = 0
+            local pathLength = 0
+            local prevPos = fromPos
+            for _, wp in ipairs(waypoints) do
+                if wp.Action == Enum.PathWaypointAction.Jump then
+                    jumpCount += 1
+                end
+                pathLength += (wp.Position - prevPos).Magnitude
+                prevPos = wp.Position
+            end
+            -- each jump counts as if it added 50 studs of "difficulty"
+            score = pathLength + (jumpCount * 50)
+        end
+
+        if not bestScore or score < bestScore then
+            bestScore = score
+            bestPart = candidate.part
+        end
+    end
+
+    return bestPart
+end
+-- Checks whether there's a clear line of sight (no solid, collidable obstruction)
+-- between two points. Casts THREE parallel rays -- center, left edge, and right
+-- edge, offset by the character's agent radius perpendicular to the direction of
+-- travel -- instead of just one down the center. A single center ray can report
+-- "clear" even when the character's actual body width would clip a wall corner;
+-- checking both edges catches that.
+local SIGHT_CHECK_RADIUS = 2.5 -- should match AgentRadius used for pathfinding
+
+local function singleRayClear(fromPos, toPos, params)
+    local direction = toPos - fromPos
+    local result = workspace:Raycast(fromPos, direction, params)
+
+    if not result then
+        return true -- nothing in the way
+    end
+    -- something was hit before reaching toPos -- only a real obstruction if it's
+    -- actually collidable (ignore decorative/non-collide clutter)
+    if result.Instance and result.Instance.CanCollide == false then
+        return true
+    end
+
+    return false
+end
+
+local function hasLineOfSight(fromPos, toPos, ignoreInstance)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {ignoreInstance}
+    params.IgnoreWater = true
+
+    local flatDir = Vector3.new(toPos.X - fromPos.X, 0, toPos.Z - fromPos.Z)
+    if flatDir.Magnitude < 0.01 then
+        return singleRayClear(fromPos, toPos, params)
+    end
+
+    -- perpendicular (horizontal) offset vector, scaled to the agent's radius
+    local perp = Vector3.new(-flatDir.Unit.Z, 0, flatDir.Unit.X) * SIGHT_CHECK_RADIUS
+
+    local checks = {
+        {fromPos, toPos},                           -- center
+        {fromPos + perp, toPos + perp},             -- left edge
+        {fromPos - perp, toPos - perp},              -- right edge
+    }
+
+    for _, pair in ipairs(checks) do
+        if not singleRayClear(pair[1], pair[2], params) then
+            return false
+        end
+    end
+
+    return true
+end
+-- Takes the raw waypoints from the pathfinder and greedily skips ahead to the
+-- farthest one it has clear line of sight to, cutting out unnecessary zig-zag
+-- waypoints while still never routing through a wall (every skip is raycast-
+-- verified first). Jump waypoints are never skipped over, since skipping would
+-- lose the jump instruction.
+local function simplifyWaypoints(waypoints, startPos, character)
+    local simplified = {}
+    local i = 1
+    local n = #waypoints
+
+    while i <= n do
+        local current = waypoints[i]
+
+        if current.Action == Enum.PathWaypointAction.Jump then
+            -- never skip past a jump waypoint -- always keep it as-is
+            table.insert(simplified, current)
+            i += 1
+        else
+            local fromPos = (i == 1) and startPos or waypoints[i - 1].Position
+            local farthest = i
+
+            for j = n, i, -1 do
+                if waypoints[j].Action == Enum.PathWaypointAction.Jump then
+                    continue -- don't skip to/through a jump waypoint
+                end
+                if hasLineOfSight(fromPos, waypoints[j].Position, character) then
+                    farthest = j
+                    break
+                end
+            end
+
+            table.insert(simplified, waypoints[farthest])
+            i = farthest + 1
+        end
+    end
+
+    return simplified
+end
+-- Last-resort recovery: tries walking the character directly away from wherever
+-- it's wedged, in several directions, using raw Humanoid:Move (bypassing
+-- pathfinding entirely) so it can't plan itself back into the same trap. This runs
+-- whenever walkToPosition fully gives up on a coin, so the character doesn't stay
+-- physically stuck in place for every subsequent coin attempt afterward.
+local UNSTUCK_DIRECTIONS = {
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+    Vector3.new(1, 0, 1).Unit, Vector3.new(-1, 0, -1).Unit,
+    Vector3.new(1, 0, -1).Unit, Vector3.new(-1, 0, 1).Unit,
+}
+local UNSTUCK_FREE_DISTANCE = 3 -- studs of actual movement that counts as "freed"
+
+-- Checks a short distance ahead in a direction for anything solid, so the escape
+-- maneuver only ever tries directions that are actually open instead of ramming
+-- into whatever's already causing the problem.
+local UNSTUCK_PROBE_DISTANCE = 4
+
+local function isDirectionClear(root, character, dir)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character}
+    params.IgnoreWater = true
+
+    local result = workspace:Raycast(root.Position, dir.Unit * UNSTUCK_PROBE_DISTANCE, params)
+
+    if not result then
+        return true
+    end
+
+    return result.Instance and result.Instance.CanCollide == false
+end
+
+local function attemptUnstuck(humanoid, root, isStillEnabled)
+    local character = humanoid.Parent
+
+    -- only consider directions that are raycast-clear right now, so it never
+    -- deliberately walks straight at the thing it's stuck on
+    local openDirections = {}
+    for _, dir in ipairs(UNSTUCK_DIRECTIONS) do
+        if isDirectionClear(root, character, dir) then
+            table.insert(openDirections, dir)
+        end
+    end
+
+    if #openDirections == 0 then
+        -- completely boxed in on all 8 sides -- walking won't help here
+        return false
+    end
+
+    for _, dir in ipairs(openDirections) do
+        if not isStillEnabled() then
+            return false
+        end
+
+        local startPos = root.Position
+        forceJump(humanoid)
+
+        local elapsed = 0
+        while elapsed < 0.4 and isStillEnabled() do
+            -- re-check every tick in case this direction becomes blocked partway
+            -- (e.g. it curves into a wall a couple studs further than the probe)
+            if not isDirectionClear(root, character, dir) then
+                break
+            end
+            pcall(function()
+                humanoid:Move(dir, false)
+            end)
+            task.wait(0.1)
+            elapsed += 0.1
+        end
+
+        pcall(function()
+            humanoid:Move(Vector3.new(0, 0, 0), false)
+        end)
+
+        if (root.Position - startPos).Magnitude >= UNSTUCK_FREE_DISTANCE then
+            return true -- moved enough to consider it freed
+        end
+    end
+
+    return false -- tried every open direction, never meaningfully moved
+end
+
+local function walkToPosition(humanoid, root, destinationPos, isStillEnabled)
+    local recomputes = 0
+
+    while recomputes <= MAX_RECOMPUTES do
+        if not isStillEnabled() then
+            return false
+        end
+
+        local rawWaypoints = computePathWaypoints(root.Position, destinationPos)
+
+        if not rawWaypoints then
+            -- No valid path at all -- fall back to a direct MoveTo
+            humanoid:MoveTo(destinationPos)
+            return (waitForMoveTo(humanoid, root, isStillEnabled, 8))
+        end
+
+        local character = humanoid.Parent
+        local waypoints = simplifyWaypoints(rawWaypoints, root.Position, character)
+
+        local needsRecompute = false
+
+        for _, waypoint in ipairs(waypoints) do
+            if not isStillEnabled() then
+                return false
+            end
+
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                forceJump(humanoid)
+            end
+
+            humanoid:MoveTo(waypoint.Position)
+
+            local reached, badlyStuck = waitForMoveTo(humanoid, root, isStillEnabled, 3)
+
+            if not isStillEnabled() then
+                return false
+            end
+
+            if badlyStuck then
+                needsRecompute = true
+                break
+            end
+
+            if not reached then
+                -- timed out without being flagged "badly" stuck -- still worth a
+                -- recompute rather than pushing on to a waypoint that may no longer
+                -- make sense from here
+                needsRecompute = true
+                break
+            end
+        end
+
+        if not needsRecompute then
+            return true -- reached every waypoint
+        end
+
+        recomputes += 1
+        task.wait(0.2)
+    end
+    -- ran out of recompute attempts -- before giving up on this coin entirely,
+    -- make sure the character isn't left physically wedged in place, or every
+    -- future coin attempt from here will fail the same way
+    attemptUnstuck(humanoid, root, isStillEnabled)
+
+    return false
+end
+local espEnabled = false
+local espHighlights = {}
+
+local MainTab = Window:CreateTab("Main", nil)
+local SettingsTab = Window:CreateTab("Settings", nil)
+-- Checks Character (equipped) and Backpack (own inventory only -- other players'
+-- Backpacks are not replicated to your client by Roblox, so this will only catch
+-- Knife/Gun for other players when they have it equipped, not sitting unequipped)
+local function getHighlightColor(player, character)
+    local hasKnife = character:FindFirstChild("Knife", true)
+    local hasGun = character:FindFirstChild("Gun", true)
+
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack then
+        hasKnife = hasKnife or backpack:FindFirstChild("Knife", true)
+        hasGun = hasGun or backpack:FindFirstChild("Gun", true)
+    end
+
+    if hasKnife then
+        return Color3.fromRGB(255, 0, 0) -- red
+    elseif hasGun then
+        return Color3.fromRGB(0, 0, 255) -- blue
+    else
+        return Color3.fromRGB(0, 255, 0) -- green
+    end
+end
+
+local function addESP(player)
+    local character = player.Character
+    if not character then return end
+
+    local highlight = Instance.new("Highlight")
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 0
+    highlight.FillColor = getHighlightColor(player, character)
+    highlight.OutlineColor = highlight.FillColor
+    highlight.Parent = character
+
+    espHighlights[player] = highlight
+
+    -- keep the color updated if they pick up/drop Knife or Gun later
+    local conn1 = character.DescendantAdded:Connect(function()
+        if espHighlights[player] then
+            espHighlights[player].FillColor = getHighlightColor(player, character)
+            espHighlights[player].OutlineColor = espHighlights[player].FillColor
+        end
+    end)
+    local conn2 = character.DescendantRemoving:Connect(function()
+        task.defer(function()
+            if espHighlights[player] then
+                espHighlights[player].FillColor = getHighlightColor(player, character)
+                espHighlights[player].OutlineColor = espHighlights[player].FillColor
+            end
+        end)
+    end)
+    -- also react to the player's own Backpack changing (covers the LocalPlayer case)
+    local backpack = player:FindFirstChild("Backpack")
+    local conn3, conn4
+    if backpack then
+        conn3 = backpack.ChildAdded:Connect(function()
+            if espHighlights[player] then
+                espHighlights[player].FillColor = getHighlightColor(player, character)
+                espHighlights[player].OutlineColor = espHighlights[player].FillColor
+            end
+        end)
+        conn4 = backpack.ChildRemoved:Connect(function()
+            if espHighlights[player] then
+                espHighlights[player].FillColor = getHighlightColor(player, character)
+                espHighlights[player].OutlineColor = espHighlights[player].FillColor
+            end
+        end)
+    end
+
+    highlight.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            conn1:Disconnect()
+            conn2:Disconnect()
+            if conn3 then conn3:Disconnect() end
+            if conn4 then conn4:Disconnect() end
+        end
+    end)
+end
+
+local function removeESP(player)
+    local highlight = espHighlights[player]
+    if highlight then
+        highlight:Destroy()
+        espHighlights[player] = nil
+    end
+end
+
+local function refreshAllESP()
+    for _, player in ipairs(Players:GetPlayers()) do
+        removeESP(player)
+        if player.Character then
+            addESP(player)
+        end
+    end
+end
+
+MainTab:CreateSlider({
+    Name = "Coin Tween Speed",
+    Range = {15, 55},
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = 25,
+    Flag = "CoinTweenSpeed",
+    Callback = function(Value)
+        COIN_TWEEN_SPEED = Value
+    end,
+})
+
+MainTab:CreateSlider({
+    Name = "Coin Delay",
+    Range = {0, 5.5},
+    Increment = 0.5,
+    Suffix = "",
+    CurrentValue = 1.5,
+    Flag = "CoinDelay",
+    Callback = function(Value)
+        COIN_DELAY = Value
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "Auto Farm Coins (Tween)",
+    CurrentValue = false,
+    Callback = function(value)
+        coinTweenEnabled = value
+        if not value then return end -- turning off just stops the loop below
+
+        task.spawn(function()
+            local char = Players.LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if not root then
+                Rayfield:Notify({
+                    Title = "No character",
+                    Content = "HumanoidRootPart not found.",
+                    Duration = 4,
+                })
+                return
+            end
+
+            local done = {}
+            while coinTweenEnabled do
+                -- keep the character reference fresh across respawns
+                char = Players.LocalPlayer.Character
+                root = char and char:FindFirstChild("HumanoidRootPart")
+                if not root then
+                    task.wait(0.5)
+                else
+                    local part = findClosestCoinServer(root.Position, done)
+                    if not part then
+                        task.wait(0.5) -- nothing new right now, check again shortly
+                    else
+                        local distance = (root.Position - part.Position).Magnitude
+                        local time = math.max(distance / COIN_TWEEN_SPEED, 0.3)
+                        local tween = TweenService:Create(
+                            root,
+                            TweenInfo.new(time, Enum.EasingStyle.Linear),
+                            {CFrame = part.CFrame}
+                        )
+                        tween:Play()
+                        tween.Completed:Wait()
+
+                        pcall(function()
+                            firetouchinterest(root, part, 0)
+                            firetouchinterest(root, part, 1)
+                        end)
+                        done[part] = true
+                        task.wait(COIN_DELAY)
+                    end
+                end
+            end
+        end)
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "Auto Farm Coins (Walk)",
+    CurrentValue = false,
+    Callback = function(value)
+        coinWalkEnabled = value
+        if not value then return end -- turning off just stops the loop below
+
+        task.spawn(function()
+            local char = Players.LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+            if not root or not humanoid then
+                Rayfield:Notify({
+                    Title = "No character",
+                    Content = "HumanoidRootPart/Humanoid not found.",
+                    Duration = 4,
+                })
+                return
+            end
+
+            local function isStillEnabled()
+                return coinWalkEnabled
+            end
+
+            local done = {}
+            while coinWalkEnabled do
+                -- keep the character reference fresh across respawns
+                char = Players.LocalPlayer.Character
+                root = char and char:FindFirstChild("HumanoidRootPart")
+                humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                if not root or not humanoid then
+                    task.wait(0.5)
+                else
+                    local part = findEasiestCoinServer(root.Position, done)
+                    if not part then
+                        task.wait(0.5) -- nothing new right now, check again shortly
+                    else
+                        -- WalkSpeed is left untouched here -- uses whatever speed
+                        -- the game itself has set for the character
+
+                        local reached = walkToPosition(humanoid, root, part.Position, isStillEnabled)
+
+                        if reached and coinWalkEnabled then
+                            pcall(function()
+                                firetouchinterest(root, part, 0)
+                                firetouchinterest(root, part, 1)
+                            end)
+                            done[part] = true
+                            task.wait(COIN_DELAY)
+                        elseif coinWalkEnabled then
+                            -- couldn't reach this one (ran out of recompute attempts) --
+                            -- give up on it permanently and move on to the next closest
+                            done[part] = true
+                            task.wait(0.3)
+                        else
+                            -- toggle was turned off mid-walk; just stop, don't mark done
+                        end
+                    end
+                end
+            end
+        end)
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "ESP",
+    CurrentValue = false,
+    Callback = function(value)
+        espEnabled = value
+
+        if not value then
+            for player in pairs(espHighlights) do
+                removeESP(player)
+            end
+            return
+        end
+
+        refreshAllESP()
+
+        for _, player in ipairs(Players:GetPlayers()) do
+            if not player:GetAttribute("_espCharConn") then
+                player:SetAttribute("_espCharConn", true)
+                player.CharacterAdded:Connect(function(character)
+                    if espEnabled then
+                        removeESP(player)
+                        task.wait(0.2) -- let character load in a bit
+                        addESP(player)
+                    end
+                end)
+            end
+        end
+
+        Players.PlayerAdded:Connect(function(player)
+            player.CharacterAdded:Connect(function(character)
+                if espEnabled then
+                    removeESP(player)
+                    task.wait(0.2)
+                    addESP(player)
+                end
+            end)
+        end)
+
+        Players.PlayerRemoving:Connect(function(player)
+            removeESP(player)
+        end)
+    end,
+})
+
+local gunDropEspEnabled = false
+local gunDropHighlights = {} -- [part] = Highlight instance
+local gunDropWatcherConn = nil
+
+local function addGunDropESP(part)
+    if gunDropHighlights[part] then return end -- already has one
+
+    local highlight = Instance.new("Highlight")
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 0
+    highlight.FillColor = Color3.fromRGB(255, 170, 0) -- orange
+    highlight.OutlineColor = Color3.fromRGB(255, 170, 0)
+    highlight.Parent = part
+
+    gunDropHighlights[part] = highlight
+
+    -- clean up automatically if the part itself gets destroyed/removed
+    part.AncestryChanged:Connect(function(_, parent)
+        if not parent and gunDropHighlights[part] then
+            gunDropHighlights[part]:Destroy()
+            gunDropHighlights[part] = nil
+        end
+    end)
+end
+
+local function removeGunDropESP(part)
+    local highlight = gunDropHighlights[part]
+    if highlight then
+        highlight:Destroy()
+        gunDropHighlights[part] = nil
+    end
+end
+
+local function scanForGunDrops()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "GunDrop" and obj:IsA("BasePart") then
+            addGunDropESP(obj)
+        end
+    end
+end
+
+MainTab:CreateToggle({
+    Name = "Gun ESP",
+    CurrentValue = false,
+    Callback = function(value)
+        gunDropEspEnabled = value
+
+        if not value then
+            if gunDropWatcherConn then
+                gunDropWatcherConn:Disconnect()
+                gunDropWatcherConn = nil
+            end
+            for part in pairs(gunDropHighlights) do
+                removeGunDropESP(part)
+            end
+            return
+        end
+
+        scanForGunDrops()
+
+        -- watch for new GunDrop parts spawning in later
+        gunDropWatcherConn = workspace.DescendantAdded:Connect(function(obj)
+            if gunDropEspEnabled and obj.Name == "GunDrop" and obj:IsA("BasePart") then
+                addGunDropESP(obj)
+            end
+        end)
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Get Gun (If Dropped)",
+    Callback = function()
+        local char = Players.LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then
+            Rayfield:Notify({
+                Title = "No character",
+                Content = "HumanoidRootPart not found.",
+                Duration = 3,
+            })
+            return
+        end
+
+        -- find the GunDrop part (same check your Gun ESP uses)
+        local drop
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj.Name == "GunDrop" and obj:IsA("BasePart") then
+                drop = obj
+                break
+            end
+        end
+
+        if not drop then
+            Rayfield:Notify({
+                Title = "GunDrop",
+                Content = "No GunDrop exists right now.",
+                Duration = 3,
+            })
+            return
+        end
+
+        local origin = root.CFrame -- where you were before pressing
+
+        root.CFrame = drop.CFrame
+        pcall(function()
+            firetouchinterest(root, drop, 0)
+            firetouchinterest(root, drop, 1)
+        end)
+
+        task.wait(0.01) -- time for the pickup to register; raise if it misses
+
+        if root.Parent then
+            root.CFrame = origin
+        end
+    end,
+})
+
+-- true if the player has the tool equipped or in their Backpack
+local function hasTool(player, toolName)
+    local char = player.Character
+    if char and char:FindFirstChild(toolName) then
+        return true
+    end
+    local backpack = player:FindFirstChild("Backpack")
+    return backpack ~= nil and backpack:FindFirstChild(toolName) ~= nil
+end
+
+-- position to aim at (their root part), only if they're alive
+local function getAimPos(player)
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root and hum and hum.Health > 0 then
+        return root.Position
+    end
+end
+
+local function makeArgs(originPos, targetPos)
+    local lookFrom = originPos
+    if (targetPos - originPos).Magnitude < 0.01 then
+        lookFrom = originPos + Vector3.new(0, 0, 0.1)
+    end
+    return CFrame.lookAt(lookFrom, targetPos), CFrame.new(targetPos)
+end
+
+-- Returns true if it replaced the game's call with its own
+local function handleSilentAim(remote, ...)
+    local args = {...}
+    local lp = Players.LocalPlayer
+    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return false end
+
+    local origin = (typeof(args[1]) == "CFrame") and args[1].Position or myRoot.Position
+
+    if remote.Name == "Shoot" and hasTool(lp, "Gun") then
+        -- Sheriff: redirect the shot at whoever has the Knife
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp and hasTool(plr, "Knife") then
+                local pos = getAimPos(plr)
+                if pos then
+                    local a1, a2 = makeArgs(origin, pos)
+                    remote.FireServer(remote, a1, a2)
+                    return true
+                end
+            end
+        end
+
+    elseif remote.Name == "KnifeThrown" and hasTool(lp, "Knife") then
+        -- Murderer: throw at everyone within range
+        local fired = false
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp then
+                local pos = getAimPos(plr)
+                if pos and (pos - myRoot.Position).Magnitude < SILENT_AIM_MAX_DISTANCE then
+                    local a1, a2 = makeArgs(origin, pos)
+                    remote.FireServer(remote, a1, a2)
+                    fired = true
+                end
+            end
+        end
+        return fired
+    end
+
+    return false
+end
+
+if hookmetamethod and newcclosure and getnamecallmethod and checkcaller then
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        if silentAimEnabled
+            and getnamecallmethod() == "FireServer"
+            and typeof(self) == "Instance"
+            and not checkcaller()
+            and (self.Name == "Shoot" or self.Name == "KnifeThrown")
+        then
+            local ok, handled = pcall(handleSilentAim, self, ...)
+            if ok and handled then
+                return
+            end
+        end
+        return oldNamecall(self, ...)
+    end))
+end
+
+-- Wall check: true if nothing solid is between origin and the target.
+-- Ignores all player characters and non-collidable parts (decor, invisible triggers).
+local function hasLineOfSight(originPos, targetPos)
+    local ignore = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then
+            table.insert(ignore, plr.Character)
+        end
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+
+    for _ = 1, 10 do
+        params.FilterDescendantsInstances = ignore
+        local result = workspace:Raycast(originPos, targetPos - originPos, params)
+        if not result then
+            return true -- nothing in the way
+        end
+        if result.Instance.CanCollide then
+            return false -- solid wall/obstacle
+        end
+        table.insert(ignore, result.Instance) -- skip non-collidable part and keep checking
+    end
+
+    return true
+end
+
+-- Returns true if it replaced the game's call with its own
+local function handleSilentAim(remote, ...)
+    local args = {...}
+    local lp = Players.LocalPlayer
+    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return false end
+
+    local origin = (typeof(args[1]) == "CFrame") and args[1].Position or myRoot.Position
+
+    if remote.Name == "Shoot" and hasTool(lp, "Gun") then
+        -- Sheriff: redirect the shot at whoever has the Knife (only if there's a clear line)
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp and hasTool(plr, "Knife") then
+                local pos = getAimPos(plr)
+                if pos and hasLineOfSight(origin, pos) then
+                    local a1, a2 = makeArgs(origin, pos)
+                    remote.FireServer(remote, a1, a2)
+                    return true
+                end
+            end
+        end
+
+    elseif remote.Name == "KnifeThrown" and hasTool(lp, "Knife") then
+        -- Murderer: throw at the closest player in range that isn't behind a wall
+        local bestPos, bestDist
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp then
+                local pos = getAimPos(plr)
+                if pos then
+                    local dist = (pos - myRoot.Position).Magnitude
+                    if dist < SILENT_AIM_MAX_DISTANCE
+                        and (not bestDist or dist < bestDist)
+                        and hasLineOfSight(origin, pos)
+                    then
+                        bestPos, bestDist = pos, dist
+                    end
+                end
+            end
+        end
+
+        if bestPos then
+            local a1, a2 = makeArgs(origin, bestPos)
+            remote.FireServer(remote, a1, a2)
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Is the position inside the cone in front of your camera? Returns (inFront, angleFromCrosshair)
+local function getFrontAngle(pos)
+    local cam = workspace.CurrentCamera
+    if not cam then return false end
+
+    local toTarget = pos - cam.CFrame.Position
+    if toTarget.Magnitude < 0.01 then return true, 0 end
+
+    local dot = math.clamp(cam.CFrame.LookVector:Dot(toTarget.Unit), -1, 1)
+    local angle = math.deg(math.acos(dot))
+    return angle <= SILENT_AIM_FOV / 2, angle
+end
+
+-- A player is a valid target only if they're alive, in front of you, and not behind a wall
+local function isValidTarget(player, origin)
+    local pos = getAimPos(player)
+    if not pos then return nil end
+
+    local inFront, angle = getFrontAngle(pos)
+    if not inFront then return nil end
+
+    if not hasLineOfSight(origin, pos) then return nil end
+
+    return pos, angle
+end
+
+-- Returns true if it replaced the game's call with its own
+local function handleSilentAim(remote, ...)
+    local args = {...}
+    local lp = Players.LocalPlayer
+    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return false end
+
+    local origin = (typeof(args[1]) == "CFrame") and args[1].Position or myRoot.Position
+
+    if remote.Name == "Shoot" and hasTool(lp, "Gun") then
+        -- Sheriff: murderer must be in front of you and not behind a wall.
+        -- If more than one Knife holder qualifies, take the one closest to your crosshair.
+        local bestPos, bestAngle
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp and hasTool(plr, "Knife") then
+                local pos, angle = isValidTarget(plr, origin)
+                if pos and (not bestAngle or angle < bestAngle) then
+                    bestPos, bestAngle = pos, angle
+                end
+            end
+        end
+
+        if bestPos then
+            local a1, a2 = makeArgs(origin, bestPos)
+            remote.FireServer(remote, a1, a2)
+            return true
+        end
+
+    elseif remote.Name == "KnifeThrown" and hasTool(lp, "Knife") then
+        -- Murderer: closest player in front of you, in range, not behind a wall
+        local bestPos, bestDist
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp then
+                local pos = isValidTarget(plr, origin)
+                if pos then
+                    local dist = (pos - myRoot.Position).Magnitude
+                    if dist < SILENT_AIM_MAX_DISTANCE and (not bestDist or dist < bestDist) then
+                        bestPos, bestDist = pos, dist
+                    end
+                end
+            end
+        end
+
+        if bestPos then
+            local a1, a2 = makeArgs(origin, bestPos)
+            remote.FireServer(remote, a1, a2)
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Where your mouse/crosshair is pointing in the world
+local function getMouseAimPos()
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+
+    local loc = UserInputService:GetMouseLocation()
+    local ray = cam:ViewportPointToRay(loc.X, loc.Y)
+    local direction = ray.Direction * 1000
+
+    local ignore = {}
+    local lpChar = Players.LocalPlayer.Character
+    if lpChar then
+        table.insert(ignore, lpChar)
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+
+    for _ = 1, 10 do
+        params.FilterDescendantsInstances = ignore
+        local result = workspace:Raycast(ray.Origin, direction, params)
+        if not result then
+            return ray.Origin + direction -- aiming at the sky/void
+        end
+        if result.Instance.CanCollide then
+            return result.Position
+        end
+        table.insert(ignore, result.Instance) -- skip non-collidable parts
+    end
+
+    return ray.Origin + direction
+end
+
+-- Alive and inside the front-sight cone. Walls are NOT checked here, that's done after picking.
+local function getFrontTarget(player)
+    local pos = getAimPos(player)
+    if not pos then return nil end
+
+    local inFront, angle = getFrontAngle(pos)
+    if not inFront then return nil end
+
+    return pos, angle
+end
+
+-- Final aim position: the player if there's a clear line, otherwise wherever your mouse points
+local function resolveAim(origin, targetPos)
+    if hasLineOfSight(origin, targetPos) then
+        return targetPos
+    end
+    return getMouseAimPos() or targetPos
+end
+
+-- Returns true if it replaced the game's call with its own
+local function handleSilentAim(remote, ...)
+    local args = {...}
+    local lp = Players.LocalPlayer
+    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return false end
+
+    local origin = (typeof(args[1]) == "CFrame") and args[1].Position or myRoot.Position
+
+    if remote.Name == "Shoot" and hasTool(lp, "Gun") then
+        -- Sheriff: Knife holder closest to your crosshair (must be in front of you)
+        local bestPos, bestAngle
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp and hasTool(plr, "Knife") then
+                local pos, angle = getFrontTarget(plr)
+                if pos and (not bestAngle or angle < bestAngle) then
+                    bestPos, bestAngle = pos, angle
+                end
+            end
+        end
+
+        if bestPos then
+            local aimPos = resolveAim(origin, bestPos) -- behind a wall -> mouse position
+            local a1, a2 = makeArgs(origin, aimPos)
+            remote.FireServer(remote, a1, a2)
+            return true
+        end
+
+    elseif remote.Name == "KnifeThrown" and hasTool(lp, "Knife") then
+        -- Murderer: closest player in front of you and within range
+        local bestPos, bestDist
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp then
+                local pos = getFrontTarget(plr)
+                if pos then
+                    local dist = (pos - myRoot.Position).Magnitude
+                    if dist < SILENT_AIM_MAX_DISTANCE and (not bestDist or dist < bestDist) then
+                        bestPos, bestDist = pos, dist
+                    end
+                end
+            end
+        end
+
+        if bestPos then
+            local aimPos = resolveAim(origin, bestPos) -- behind a wall -> mouse position
+            local a1, a2 = makeArgs(origin, aimPos)
+            remote.FireServer(remote, a1, a2)
+            return true
+        end
+    end
+
+    return false
+end
+
+MainTab:CreateToggle({
+    Name = "Silent Aim",
+    CurrentValue = false,
+    Callback = function(value)
+        if value and not (hookmetamethod and newcclosure and getnamecallmethod and checkcaller) then
+            Rayfield:Notify({
+                Title = "Silent Aim",
+                Content = "Your executor doesn't support hookmetamethod.",
+                Duration = 4,
+            })
+            return
+        end
+        silentAimEnabled = value
+    end,
+})
+
+MainTab:CreateSlider({
+    Name = "Silent Aim FOV",
+    Range = {10, 180},
+    Increment = 5,
+    Suffix = "°",
+    CurrentValue = 90,
+    Flag = "SilentAimFOV",
+    Callback = function(Value)
+        SILENT_AIM_FOV = Value
+    end,
+})
+
+SettingsTab:CreateButton({
+   Name = "Rejoin",
+   Callback = function()
+        game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId)
+   end,
+})
+
+SettingsTab:CreateToggle({
+    Name = "Disable 3D Rendering",
+    CurrentValue = false,
+    Flag = "Disable3DRendering",
+    Callback = function(Value)
+        if Value then
+            RunService:Set3dRenderingEnabled(false)
+        else
+            RunService:Set3dRenderingEnabled(true)
+        end
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "Destroy UI",
+    Callback = function()
+        Rayfield:Destroy()
+    end
+})
