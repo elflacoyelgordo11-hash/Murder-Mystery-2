@@ -38,6 +38,8 @@ local AUTO_THROW_COOLDOWN = 1.0
 local AUTO_STAB_RANGE = 6        -- melee swing when this close to the closest target
 local FLEE_RANGE = 70            -- how far away a knife holder can be and still count as a threat
 local FLEE_CLOSE_RANGE = 22      -- inside this, any equipped knife holder counts even if not running at you
+local autoGetGunEnabled = false
+local autoGetGunToken = 0
 local nextJukeAt, jukeUntil, jukeDir = 0, 0, nil
 local AntiAFK = false
 local AntiAFKConnection = nil
@@ -456,6 +458,8 @@ local function walkToPosition(humanoid, root, destinationPos, isStillEnabled)
 end
 local espEnabled = false
 local espHighlights = {}
+local espConnections = {}
+local espCharacterConnections = {}
 
 local MainTab = Window:CreateTab("Main", nil)
 local SettingsTab = Window:CreateTab("Settings", nil)
@@ -482,6 +486,8 @@ local function getHighlightColor(player, character)
 end
 
 local function addESP(player)
+    if not espEnabled or espHighlights[player] or player.Parent ~= Players then return end
+
     local character = player.Character
     if not character then return end
 
@@ -493,54 +499,55 @@ local function addESP(player)
     highlight.Parent = character
 
     espHighlights[player] = highlight
+    local connections = {}
+    espConnections[player] = connections
     -- keep the color updated if they pick up/drop Knife or Gun later
-    local conn1 = character.DescendantAdded:Connect(function()
+    table.insert(connections, character.DescendantAdded:Connect(function()
         if espHighlights[player] then
             espHighlights[player].FillColor = getHighlightColor(player, character)
             espHighlights[player].OutlineColor = espHighlights[player].FillColor
         end
-    end)
-    local conn2 = character.DescendantRemoving:Connect(function()
+    end))
+    table.insert(connections, character.DescendantRemoving:Connect(function()
         task.defer(function()
             if espHighlights[player] then
                 espHighlights[player].FillColor = getHighlightColor(player, character)
                 espHighlights[player].OutlineColor = espHighlights[player].FillColor
             end
         end)
-    end)
+    end))
     -- also react to the player's own Backpack changing (covers the LocalPlayer case)
     local backpack = player:FindFirstChild("Backpack")
-    local conn3, conn4
     if backpack then
-        conn3 = backpack.ChildAdded:Connect(function()
+        table.insert(connections, backpack.ChildAdded:Connect(function()
             if espHighlights[player] then
                 espHighlights[player].FillColor = getHighlightColor(player, character)
                 espHighlights[player].OutlineColor = espHighlights[player].FillColor
             end
-        end)
-        conn4 = backpack.ChildRemoved:Connect(function()
+        end))
+        table.insert(connections, backpack.ChildRemoved:Connect(function()
             if espHighlights[player] then
                 espHighlights[player].FillColor = getHighlightColor(player, character)
                 espHighlights[player].OutlineColor = espHighlights[player].FillColor
             end
-        end)
+        end))
     end
-
-    highlight.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            conn1:Disconnect()
-            conn2:Disconnect()
-            if conn3 then conn3:Disconnect() end
-            if conn4 then conn4:Disconnect() end
-        end
-    end)
 end
 
 local function removeESP(player)
     local highlight = espHighlights[player]
+    espHighlights[player] = nil
+    local connections = espConnections[player]
+    espConnections[player] = nil
+
+    if connections then
+        for _, connection in ipairs(connections) do
+            connection:Disconnect()
+        end
+    end
+
     if highlight then
         highlight:Destroy()
-        espHighlights[player] = nil
     end
 end
 
@@ -552,6 +559,39 @@ local function refreshAllESP()
         end
     end
 end
+
+local function watchPlayerESP(player)
+    if espCharacterConnections[player] then return end
+
+    espCharacterConnections[player] = player.CharacterAdded:Connect(function(character)
+        if not espEnabled then return end
+
+        removeESP(player)
+        task.wait(0.2)
+        if espEnabled and player.Parent == Players and player.Character == character then
+            addESP(player)
+        end
+    end)
+
+    if espEnabled and player.Character then
+        addESP(player)
+    end
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    watchPlayerESP(player)
+end
+
+Players.PlayerAdded:Connect(watchPlayerESP)
+Players.PlayerRemoving:Connect(function(player)
+    removeESP(player)
+
+    local connection = espCharacterConnections[player]
+    if connection then
+        connection:Disconnect()
+        espCharacterConnections[player] = nil
+    end
+end)
 
 MainTab:CreateSlider({
     Name = "Coin Tween Speed",
@@ -702,40 +742,17 @@ MainTab:CreateToggle({
         espEnabled = value
 
         if not value then
+            local playersToRemove = {}
             for player in pairs(espHighlights) do
+                table.insert(playersToRemove, player)
+            end
+            for _, player in ipairs(playersToRemove) do
                 removeESP(player)
             end
             return
         end
 
         refreshAllESP()
-
-        for _, player in ipairs(Players:GetPlayers()) do
-            if not player:GetAttribute("_espCharConn") then
-                player:SetAttribute("_espCharConn", true)
-                player.CharacterAdded:Connect(function(character)
-                    if espEnabled then
-                        removeESP(player)
-                        task.wait(0.2) -- let character load in a bit
-                        addESP(player)
-                    end
-                end)
-            end
-        end
-
-        Players.PlayerAdded:Connect(function(player)
-            player.CharacterAdded:Connect(function(character)
-                if espEnabled then
-                    removeESP(player)
-                    task.wait(0.2)
-                    addESP(player)
-                end
-            end)
-        end)
-
-        Players.PlayerRemoving:Connect(function(player)
-            removeESP(player)
-        end)
     end,
 })
 
@@ -806,6 +823,48 @@ MainTab:CreateToggle({
     end,
 })
 -- ================= Get Gun button =================
+local AUTO_GET_GUN_MAX_DISTANCE = 5000
+
+local function findGunDropPart(fromPosition, maxDistance)
+    local closestDrop, closestDistance
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "GunDrop" and obj:IsA("BasePart") then
+            if not fromPosition or not maxDistance then
+                return obj
+            end
+
+            local distance = (obj.Position - fromPosition).Magnitude
+            if distance <= maxDistance and (not closestDistance or distance < closestDistance) then
+                closestDrop = obj
+                closestDistance = distance
+            end
+        end
+    end
+    return closestDrop
+end
+
+local function touchGunDrop(drop)
+    local character = Players.LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root or not drop or not drop:IsDescendantOf(workspace) then
+        return false
+    end
+
+    local origin = root.CFrame
+    root.CFrame = drop.CFrame
+    pcall(function()
+        firetouchinterest(root, drop, 0)
+        firetouchinterest(root, drop, 1)
+    end)
+
+    task.wait(0.01)
+
+    if root.Parent then
+        root.CFrame = origin
+    end
+    return true
+end
+
 MainTab:CreateButton({
     Name = "Get Gun (If Dropped)",
     Callback = function()
@@ -820,14 +879,7 @@ MainTab:CreateButton({
             return
         end
 
-        local drop
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj.Name == "GunDrop" and obj:IsA("BasePart") then
-                drop = obj
-                break
-            end
-        end
-
+        local drop = findGunDropPart()
         if not drop then
             Rayfield:Notify({
                 Title = "GunDrop",
@@ -837,18 +889,180 @@ MainTab:CreateButton({
             return
         end
 
-        local origin = root.CFrame -- where you were before pressing
+        touchGunDrop(drop)
+    end,
+})
 
-        root.CFrame = drop.CFrame
-        pcall(function()
-            firetouchinterest(root, drop, 0)
-            firetouchinterest(root, drop, 1)
+MainTab:CreateToggle({
+    Name = "Auto Get Gun (If Dropped)",
+    CurrentValue = false,
+    Callback = function(value)
+        autoGetGunEnabled = value
+        autoGetGunToken += 1
+        local token = autoGetGunToken
+
+        if not value then return end
+
+        task.spawn(function()
+            while autoGetGunEnabled and token == autoGetGunToken do
+                local localPlayer = Players.LocalPlayer
+                local character = localPlayer.Character
+                local backpack = localPlayer:FindFirstChild("Backpack")
+                local hasGun = (character and character:FindFirstChild("Gun"))
+                    or (backpack and backpack:FindFirstChild("Gun"))
+                local hasKnife = (character and character:FindFirstChild("Knife"))
+                    or (backpack and backpack:FindFirstChild("Knife"))
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+
+                if not hasGun and not hasKnife and root then
+                    local drop = findGunDropPart(root.Position, AUTO_GET_GUN_MAX_DISTANCE)
+                    if drop then
+                        touchGunDrop(drop)
+                        task.wait(0.75)
+                    else
+                        task.wait(0.25)
+                    end
+                else
+                    task.wait(0.25)
+                end
+            end
         end)
+    end,
+})
 
-        task.wait(0.01) -- time for the pickup to register; raise if it misses
+local radioPlayerByOption = {}
+local selectedRadioPlayer = nil
 
-        if root.Parent then
-            root.CFrame = origin
+local function refreshRadioPlayerOptions()
+    local options = {}
+    radioPlayerByOption = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local option = string.format("%s (@%s)", player.DisplayName, player.Name)
+        table.insert(options, option)
+        radioPlayerByOption[option] = player
+    end
+
+    return options
+end
+
+local radioPlayerDropdown = MainTab:CreateDropdown({
+    Name = "Radio Player",
+    Options = refreshRadioPlayerOptions(),
+    CurrentOption = {},
+    MultipleOptions = false,
+    Callback = function(option)
+        selectedRadioPlayer = type(option) == "table" and option[1] or option
+    end,
+})
+
+local function updateRadioPlayerDropdown()
+    local options = refreshRadioPlayerOptions()
+    if selectedRadioPlayer and not radioPlayerByOption[selectedRadioPlayer] then
+        selectedRadioPlayer = nil
+    end
+    radioPlayerDropdown:Refresh(options, true)
+end
+
+Players.PlayerAdded:Connect(function()
+    task.defer(updateRadioPlayerDropdown)
+end)
+
+Players.PlayerRemoving:Connect(function()
+    task.defer(updateRadioPlayerDropdown)
+end)
+
+MainTab:CreateButton({
+    Name = "Refresh Radio Players",
+    Callback = function()
+        updateRadioPlayerDropdown()
+        Rayfield:Notify({
+            Title = "Radio Song ID",
+            Content = "Player list refreshed. Select a player, then get their song ID.",
+            Duration = 3,
+        })
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Copy/Print Selected Player's Song ID",
+    Callback = function()
+        local player = radioPlayerByOption[selectedRadioPlayer]
+        if not player or player.Parent ~= Players then
+            Rayfield:Notify({
+                Title = "Radio Song ID",
+                Content = "Select a player from the Radio Player dropdown.",
+                Duration = 4,
+            })
+            return
+        end
+
+        local radioSounds = {}
+        local playingSounds = {}
+        local seenIds = {}
+        local seenRadioIds = {}
+        local character = player.Character
+
+        if character then
+            for _, object in ipairs(character:GetDescendants()) do
+                if object:IsA("Sound") and object.IsPlaying then
+                    local id = object.SoundId:match("[?&]id=(%d+)")
+                        or object.SoundId:match("rbxassetid://(%d+)")
+                        or object.SoundId:match("^(%d+)$")
+
+                    if id and not seenIds[id] then
+                        local entry = {id = id, name = object:GetFullName()}
+                        seenIds[id] = entry
+                        table.insert(playingSounds, entry)
+                    end
+
+                    if id then
+                        local current = object
+                        while current and current ~= character do
+                            if string.find(string.lower(current.Name), "radio", 1, true) then
+                                if not seenRadioIds[id] then
+                                    seenRadioIds[id] = true
+                                    table.insert(radioSounds, seenIds[id])
+                                end
+                                break
+                            end
+                            current = current.Parent
+                        end
+                    end
+                end
+            end
+        end
+
+        local results = #radioSounds > 0 and radioSounds or playingSounds
+        if #results == 0 then
+            Rayfield:Notify({
+                Title = "Radio Song ID",
+                Content = "No currently playing sound with a readable ID was found on " .. player.Name .. ".",
+                Duration = 4,
+            })
+            return
+        end
+
+        local ids = {}
+        for _, result in ipairs(results) do
+            table.insert(ids, result.id)
+            print(string.format("[Radio Song ID] %s (%s): %s", player.Name, result.name, result.id))
+        end
+
+        if setclipboard then
+            setclipboard(table.concat(ids, "\n"))
+            Rayfield:Notify({
+                Title = "Radio Song ID",
+                Content = #ids == 1 and ("Copied " .. player.Name .. "'s song ID: " .. ids[1])
+                    or ("Copied " .. #ids .. " IDs from " .. player.Name .. "; see console."),
+                Duration = 4,
+            })
+        else
+            Rayfield:Notify({
+                Title = "Radio Song ID",
+                Content = "Printed " .. player.Name .. "'s song ID(s) to the console; clipboard is unavailable.",
+                Duration = 4,
+            })
         end
     end,
 })
@@ -1034,7 +1248,9 @@ if hookmetamethod and newcclosure and getnamecallmethod and checkcaller then
             and (self.Name == "Shoot" or self.Name == "KnifeThrown")
         then
             local ok, handled = pcall(handleSilentAim, self, ...)
-            if ok and handled then
+            if not ok then
+                warn("[Silent Aim] Targeting failed: " .. tostring(handled))
+            elseif handled then
                 return
             end
         end
