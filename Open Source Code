@@ -17,6 +17,7 @@ local PathfindingService = game:GetService("PathfindingService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local VirtualUser = game:GetService("VirtualUser")
+local LocalPlayer = Players.LocalPlayer
 
 local coinTweenEnabled = false
 local coinWalkEnabled = false
@@ -29,6 +30,7 @@ local SILENT_AIM_FOV = 90 -- total cone angle in degrees, centered on your camer
 local autoPlayEnabled = false
 local autoPlayToken = 0
 local autoCoinDone = {}
+local autoupdate = false
 local lastShot, lastThrow = 0, 0
 local AUTO_MAX_DISTANCE = 5000   -- knife targets / GunDrop range
 local AUTO_SHOOT_RANGE = 250     -- sheriff only fires inside this range
@@ -43,6 +45,16 @@ local autoGetGunToken = 0
 local nextJukeAt, jukeUntil, jukeDir = 0, 0, nil
 local AntiAFK = false
 local AntiAFKConnection = nil
+local VerticalDepth = 7
+local FakeInvisible = false
+local AccurateCharacterRepresentation = false
+local Character
+local Humanoid
+local RootPart
+local Old
+
+local Connections = {}
+local RenderSteps = {}
 -- Finds the closest part currently named "Coin_Server" that we haven't already fired
 -- and that's within COIN_MAX_DISTANCE -- farther ones are skipped (not marked done,
 -- so they'll naturally get picked up once they're close enough)
@@ -592,6 +604,233 @@ Players.PlayerRemoving:Connect(function(player)
         espCharacterConnections[player] = nil
     end
 end)
+--Invisablilty
+local Rotation90 = CFrame.Angles(math.rad(90), 0, 0)
+local RenderName = "RayfieldFakeInvisible"
+
+local function UpdateCharacter()
+    Character = LocalPlayer.Character
+    Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+    RootPart = Character and Character:FindFirstChild("HumanoidRootPart")
+    Old = RootPart and RootPart.CFrame
+end
+
+UpdateCharacter()
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(0.2)
+    UpdateCharacter()
+end)
+
+LocalPlayer.CharacterRemoving:Connect(function(char)
+    if char == Character then
+        Character = nil
+        Humanoid = nil
+        RootPart = nil
+        Old = nil
+    end
+end)
+
+local function StopFakeInvisible()
+    if not FakeInvisible then return end
+
+    for _, connection in ipairs(Connections) do
+        connection:Disconnect()
+    end
+
+    table.clear(Connections)
+
+    for _, name in ipairs(RenderSteps) do
+        RunService:UnbindFromRenderStep(name)
+    end
+
+    table.clear(RenderSteps)
+
+    if RootPart and Old then
+        RootPart.CFrame = Old
+    end
+
+    FakeInvisible = false
+end
+
+local function StartFakeInvisible()
+    if FakeInvisible then return end
+
+    UpdateCharacter()
+
+    if not RootPart then
+        Rayfield:Notify({
+            Title = "Fake Invisibility",
+            Content = "Character not found.",
+            Duration = 3
+        })
+        return
+    end
+
+    Old = RootPart.CFrame
+    FakeInvisible = true
+
+    table.insert(RenderSteps, RenderName)
+
+    RunService:BindToRenderStep(
+        RenderName,
+        Enum.RenderPriority.Camera.Value - 1,
+        function()
+            if RootPart and Old then
+                RootPart.CFrame = Old
+            end
+        end
+    )
+
+    table.insert(
+        Connections,
+        RunService.PostSimulation:Connect(function()
+            if not RootPart or not RootPart.Parent then return end
+
+            Old = RootPart.CFrame
+
+            RootPart.CFrame =
+                CFrame.new(
+                    RootPart.Position - Vector3.new(0, VerticalDepth, 0)
+                ) * Rotation90
+        end)
+    )
+end
+
+local CapturedPlayers = {
+    Knife = {},
+    Gun = {},
+    None = {}
+}
+
+local BroughtPlayers = {}   -- players currently held in front of you
+local SavedState = {}       -- [player] = {Root, Anchored, CFrame} captured before holding
+local BringConnection = nil
+
+local function HasTool(player, toolName)
+    local function Check(container)
+        if not container then return false end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and item.Name == toolName then
+                return true
+            end
+        end
+        return false
+    end
+    return Check(player.Backpack) or Check(player.Character)
+end
+
+-- Stops the hold loop and returns every held player to their original position
+local function ReleaseAll()
+    if BringConnection then
+        BringConnection:Disconnect()
+        BringConnection = nil
+    end
+
+    for player, state in pairs(SavedState) do
+        -- Only restore if the same character/root still exists (skip if they respawned)
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root and root == state.Root then
+            root.Anchored = state.Anchored
+            root.CFrame = state.CFrame
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+
+    SavedState = {}
+    BroughtPlayers = {}
+end
+
+-- Rebuilds the captured lists from the current server players
+local function ScanPlayers()
+    CapturedPlayers = {Knife = {}, Gun = {}, None = {}}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local hasKnife = HasTool(player, "Knife")
+            local hasGun = HasTool(player, "Gun")
+
+            if hasKnife then
+                table.insert(CapturedPlayers.Knife, player)
+            end
+            if hasGun then
+                table.insert(CapturedPlayers.Gun, player)
+            end
+            if not hasKnife and not hasGun then
+                table.insert(CapturedPlayers.None, player)
+            end
+        end
+    end
+end
+-- Places every held player close in front of you, every frame
+local function HoldPlayers()
+    local localChar = LocalPlayer.Character
+    local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+    if not localRoot then return end
+
+    local slot = 0
+    for _, player in ipairs(BroughtPlayers) do
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root and player.Parent == Players then
+            -- Save the original position the first time we hold this player
+            if SavedState[player] == nil or SavedState[player].Root ~= root then
+                SavedState[player] = {
+                    Root = root,
+                    Anchored = root.Anchored,
+                    CFrame = root.CFrame
+                }
+            end
+
+            local column = (slot %3) - 1          -- -1, 0, 1 (left, middle, right)
+            local row = math.floor(slot / 3)
+            local offset = Vector3.new(column * 2.5, 0, -(3 + row * 2.5))
+
+            root.Anchored = true
+            root.CFrame = localRoot.CFrame * CFrame.new(offset)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            slot = slot + 1
+        end
+    end
+end
+
+-- Adds a captured group to the held list and keeps them in front of you until Refresh
+local function BringPlayers(mode)
+    local localChar = LocalPlayer.Character
+    local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+    if not localRoot then
+        Rayfield:Notify({Title = "Error", Content = "Your character is not loaded.", Duration = 3})
+        return
+    end
+
+    local alreadyHeld = {}
+    for _, player in ipairs(BroughtPlayers) do
+        alreadyHeld[player] = true
+    end
+
+    local added = 0
+    for _, player in ipairs(CapturedPlayers[mode]) do
+        if not alreadyHeld[player] and player.Parent == Players then
+            table.insert(BroughtPlayers, player)
+            alreadyHeld[player] = true
+            added = added + 1
+        end
+    end
+
+    if not BringConnection then
+        BringConnection = RunService.RenderStepped:Connect(HoldPlayers)
+    end
+    HoldPlayers()
+
+    Rayfield:Notify({
+        Title = "Bring Players",
+        Content = "Holding " .. #BroughtPlayers .. " player(s) in front of you. Added " .. added .. ".",
+        Duration = 3
+    })
+end
 
 MainTab:CreateSlider({
     Name = "Coin Tween Speed",
@@ -615,6 +854,17 @@ MainTab:CreateSlider({
     Callback = function(Value)
         COIN_DELAY = Value
     end,
+})
+
+MainTab:CreateSlider({
+    Name = "Fake Invisibility Depth",
+    Range = {1, 50},
+    Increment = 1,
+    CurrentValue = 7,
+    Flag = "FakeInvisibleDepth",
+    Callback = function(Value)
+        VerticalDepth = Value
+    end
 })
 
 MainTab:CreateToggle({
@@ -733,6 +983,20 @@ MainTab:CreateToggle({
             end
         end)
     end,
+})
+
+MainTab:CreateToggle({
+    Name = "Fake Invisibility",
+    CurrentValue = false,
+    Flag = "FakeInvisibleToggle",
+
+    Callback = function(Value)
+        if Value then
+            StartFakeInvisible()
+        else
+            StopFakeInvisible()
+        end
+    end
 })
 
 MainTab:CreateToggle({
@@ -929,6 +1193,81 @@ MainTab:CreateToggle({
         end)
     end,
 })
+
+MainTab:CreateButton({
+    Name = "Bring Murderer (Client)",
+    Callback = function()
+        BringPlayers("Knife")
+    end
+})
+
+MainTab:CreateButton({
+    Name = "Bring Sheriff(Client)",
+    Callback = function()
+        BringPlayers("Gun")
+    end
+})
+
+MainTab:CreateButton({
+    Name = "Bring Innocent(Client)",
+    Callback = function()
+        BringPlayers("None")
+    end
+})
+
+MainTab:CreateButton({
+    Name = "Release Everyone",
+    Callback = function()
+        ReleaseAll()
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Refresh Player List",
+    Callback = function()
+        ScanPlayers()
+        Rayfield:Notify({
+            Title = "Refresh Players",
+            Content = string.format("Murderer: %d | Sheriff: %d | Innocent: %d",
+                #CapturedPlayers.Knife, #CapturedPlayers.Gun, #CapturedPlayers.None),
+            Duration = 3
+        })
+    end
+})
+
+MainTab:CreateButton({
+    Name = "Refresh Player List/Release Everyone",
+    Callback = function()
+        ReleaseAll()
+        ScanPlayers()
+        Rayfield:Notify({
+            Title = "Refresh Players",
+            Content = string.format("Murderer: %d | Sheriff: %d | Innocent: %d",
+                #CapturedPlayers.Knife, #CapturedPlayers.Gun, #CapturedPlayers.None),
+            Duration = 3
+        })
+    end
+})
+
+MainTab:CreateToggle({
+    Name = "Auto Refresh Player List ",
+    CurrentValue = false,
+    Flag = "PrintLoopToggle",
+    Callback = function(Value)
+        autoupdate = Value
+
+        if Value then
+            task.spawn(function()
+                while autoupdate do
+                    ScanPlayers()
+                    task.wait(0.1) -- Waits 0.1 second between prints
+                end
+            end)
+        end
+    end,
+})
+--Scans Players right when executuing this script
+ScanPlayers()
 
 local radioPlayerByOption = {}
 local selectedRadioPlayer = nil
